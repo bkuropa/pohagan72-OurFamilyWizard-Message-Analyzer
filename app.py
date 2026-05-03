@@ -8,6 +8,8 @@ and report generation triggering.
 """
 
 import os
+import sys
+sys.modules['waitress'] = None  # Prevent waitress import
 import io
 import re
 import fitz  # PyMuPDF for PDF processing
@@ -23,8 +25,8 @@ import concurrent.futures # For parallel processing of tasks (uploads, AI calls)
 import threading # Potentially for thread-local data (though not explicitly used here)
 
 # --- Google AI Imports ---
-import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
+from google import genai
+from google.genai import types, errors
 from google.api_core.exceptions import ResourceExhausted, GoogleAPIError
 
 # --- Flask Imports ---
@@ -45,9 +47,15 @@ from azure.storage.blob import BlobServiceClient, ContainerClient
 AZURE_STORAGE_CONNECTION_STRING = "InsertYourConnectionString"
 AZURE_STORAGE_CONTAINER_NAME = "tempfiles"
 
+# Check if Azure is configured
+USE_AZURE = AZURE_STORAGE_CONNECTION_STRING != "InsertYourConnectionString" and bool(AZURE_STORAGE_CONNECTION_STRING.strip())
+
+# Local reports directory if Azure not used
+LOCAL_REPORTS_DIR = os.path.join(os.getcwd(), "reports") if not USE_AZURE else None
+
 # Google AI API Key and Model
-GOOGLE_API_KEY = "InsertYourAPIKey"
-GEMINI_MODEL_NAME = "gemini-1.5-flash-latest" # Model for Google AI analysis
+GOOGLE_API_KEY = "AIzaSyCxEfOcVsQAn2OMyvgrVGEZlg8id9NFBKo"
+GEMINI_MODEL_NAME = "gemini-2.5-flash" # Model for Google AI analysis
 
 # Azure OpenAI Service configuration
 AZURE_OAI_ENDPOINT = "YourEndPoint"
@@ -77,7 +85,7 @@ app.config['SESSION_COOKIE_SAMESITE'] = 'Lax' # Session cookie security setting
 # --- Configure Google AI Client ---
 # Initialize the Google AI client upon application start
 try:
-    genai.configure(api_key=GOOGLE_API_KEY)
+    genai_client = genai.Client(api_key=GOOGLE_API_KEY)
     print("Google AI SDK configured successfully.")
 except Exception as e:
     # Log a warning if configuration fails, Gemini model won't be usable
@@ -113,11 +121,19 @@ Instructions for Monthly Analysis:
         {{"timestamp": "MM/DD/YYYY at HH:MM AM/PM", "sender": "Another Person", "quote": "Another quote about finances."}}
       ]
     - Search for explicit references within this month's messages. Include related terms (e.g., 'tuition', 'payment', 'debt', 'cost', 'HOA', 'miles', 'bank', 'insurance', 'ATM', 'dollars', '$', 'reimburse' for money; 'beer', 'wine', 'drinking' for alcohol; 'marijuana', 'pills', 'substance', 'herbs' for drugs).
+    - Also look for manipulative or aggressive parenting language, including superiority, gaslighting, character attacks, emotional coercion, and disparaging statements about the other parent's honesty, competence, or medical condition.
     - If mentions are found, extract the EXACT 'Sent: MM/DD/YYYY at HH:MM AM/PM' timestamp from the specific message where the quote appears.
     - IMPORTANT: Also extract the sender's name (the value usually found after 'From:' near the start of the message) for the **sender** key.
     - Provide the most relevant quote containing the mention for the **quote** key.
     - If NO mentions are found for a category, return an empty list for that key (e.g., "drug_mentions": []). Do NOT put strings like "None found" inside the list.
-- For "conflict_negativity_analysis": Assess the emotional tone specific to this month. Use quotes to support the analysis where appropriate. Be specific about the nature of the negativity.
+- For "conflict_negativity_analysis": Assess the emotional tone specific to this month. Use quotes to support the analysis where appropriate. Be specific about the nature of the negativity, including superiority, manipulation, gaslighting, character attacks, or controlling behavior. 
+    - Also identify patterns consistent with COERCIVE CONTROL as defined in Ontario family law, including:
+      * Communication that becomes harassment or surveillance (excessive texting, monitoring, demands for immediate response, threats, showing up uninvited)
+      * Financial control or manipulation (withholding support, blocking access to funds, demanding punitive receipts, interfering with employment)
+      * Isolation from support (insisting certain people are "unsafe," creating conflict around seeking help, interfering with therapy or medical appointments)
+      * Parenting gatekeeping (refusing reasonable exchanges, unilaterally changing schedules, undermining authority, withholding information, using child as messenger)
+      * Litigation abuse (frivolous motions, excessive demands, threats to "take everything," refusal to follow orders, using court as weapon)
+    - Note the cumulative effect and pattern, not just isolated incidents.
 
 Messages Log for {month_year_str}:
 {combined_messages}
@@ -147,6 +163,15 @@ Instructions for Yearly Synthesis:
     - The format MUST remain a JSON list of objects, each with "timestamp", "sender", and "quote". Ensure you include the sender's name associated with each aggregated quote.
     - If NO significant mentions were noted across the year in the monthly reports for a category, return an empty list (e.g., "drug_mentions": []).
 - For "conflict_negativity_analysis": Provide a holistic view of the conflict and tone for the year. Identify major arguments, persistent issues, or overall relationship dynamics evident from the monthly analyses. Note any significant escalations or de-escalations.
+    - Pay special attention to ongoing emotional aggression, superiority-based behavior, manipulation, gaslighting, character attacks, and coercive or controlling statements.
+    - Assess whether patterns consistent with COERCIVE CONTROL (under Ontario family law) are evident across the year. Look for the CUMULATIVE EFFECT of:
+      * Repeated harassment or surveillance through communication
+      * Financial control or instability tactics
+      * Isolation from support networks
+      * Parenting gatekeeping or refusal to cooperate
+      * Litigation abuse or court process weaponization
+    - Note if the patterns create a power imbalance, restrict independence, or establish ongoing dominance.
+    - Indicate whether these patterns appear directed at establishing fear, dependence, or compliance.
 
 Monthly Analysis Data for {year}:
 {formatted_monthly_analyses}
@@ -165,13 +190,15 @@ def extract_text_and_participants(pdf_stream):
     Returns:
         A tuple containing:
         - full_text (str): The concatenated text content of all pages.
-        - participants (str): A comma-separated string of detected participant names,
-                              or "Unknown" if not found.
+        - participants_str (str): A comma-separated string of detected participant names,
+                                  or "Unknown" if not found.
+        - participants_list (list): A list of detected participant names.
     Raises:
         Exception: If there's an error opening or reading the PDF using PyMuPDF.
     """
     full_text = ""
-    participants = "Unknown"
+    participants_str = "Unknown"
+    participants_list = []
     try:
         # Open PDF from memory stream
         with fitz.open(stream=pdf_stream, filetype="pdf") as doc:
@@ -185,7 +212,7 @@ def extract_text_and_participants(pdf_stream):
                 participants_raw = participants_match.group(1).strip()
                 # Split and clean names
                 participants_list = [p.strip() for p in re.split(r'[,\n]+', participants_raw) if p.strip()]
-                participants = ', '.join(participants_list)
+                participants_str = ', '.join(participants_list)
             else:
                  # Log warning if participants aren't found in the expected location
                  print("Warning: Could not find 'Parents:' line in the first few pages.", flush=True)
@@ -201,7 +228,7 @@ def extract_text_and_participants(pdf_stream):
         # Log and re-raise errors during PDF processing
         print(f"Error opening or reading PDF: {e}", flush=True)
         raise
-    return full_text, participants
+    return full_text, participants_str, participants_list
 
 def clean_message_text(text):
     """
@@ -507,25 +534,38 @@ def call_gemini_flash(input_content, participants, time_period_str, prompt_creat
     prompt = prompt_creator_func(participants, time_period_str, input_content)
 
     # Configure safety settings to block only high-risk content
-    safety_settings = {
-        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
-    }
+    safety_settings = [
+        types.SafetySetting(
+            category='HARM_CATEGORY_HARASSMENT',
+            threshold='BLOCK_ONLY_HIGH'
+        ),
+        types.SafetySetting(
+            category='HARM_CATEGORY_HATE_SPEECH',
+            threshold='BLOCK_ONLY_HIGH'
+        ),
+        types.SafetySetting(
+            category='HARM_CATEGORY_SEXUALLY_EXPLICIT',
+            threshold='BLOCK_ONLY_HIGH'
+        ),
+        types.SafetySetting(
+            category='HARM_CATEGORY_DANGEROUS_CONTENT',
+            threshold='BLOCK_ONLY_HIGH'
+        ),
+    ]
     # Configure generation parameters (token limit, temperature, JSON output)
-    generation_config = genai.types.GenerationConfig(
+    config = types.GenerateContentConfig(
         max_output_tokens=8192, # Gemini Flash has a large context window
         temperature=0.2,
         top_p=0.95,
-        response_mime_type="application/json" # Request JSON output directly
+        response_mime_type="application/json", # Request JSON output directly
+        safety_settings=safety_settings
     )
     # Initialize the generative model
-    model = genai.GenerativeModel(
-        model_name=GEMINI_MODEL_NAME,
-        safety_settings=safety_settings,
-        generation_config=generation_config
-    )
+    # model = genai.GenerativeModel(
+    #     model_name=GEMINI_MODEL_NAME,
+    #     safety_settings=safety_settings,
+    #     generation_config=generation_config
+    # )
 
     current_wait = INITIAL_WAIT_SECONDS # Initial delay for retries
     # Retry loop
@@ -533,24 +573,27 @@ def call_gemini_flash(input_content, participants, time_period_str, prompt_creat
         print(f"  Attempt {attempt + 1}/{MAX_RETRIES + 1} calling Google Gemini for {time_period_str}...", flush=True)
         try:
             # Make the API call
-            response = model.generate_content(prompt, request_options={'timeout': 400}) # Set timeout
+            response = genai_client.models.generate_content(
+                model=GEMINI_MODEL_NAME,
+                contents=prompt,
+                config=config
+            )
 
             raw_text = "N/A" # Placeholder for raw response text
 
             # --- Process Gemini Response ---
             try:
                 # Check for safety blocks first
-                if not response.candidates and hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
-                    block_reason = response.prompt_feedback.block_reason.name
-                    block_details = response.prompt_feedback.safety_ratings if response.prompt_feedback.safety_ratings else "No specific ratings."
+                if response.candidates and response.candidates[0].finish_reason == 'SAFETY':
+                    block_reason = response.candidates[0].finish_reason
+                    block_details = getattr(response.candidates[0], 'safety_ratings', 'No specific ratings.')
                     print(f"Error: Gemini response BLOCKED for {time_period_str}. Reason: {block_reason}. Details: {block_details}", flush=True)
                     return {"error": f"Gemini response blocked due to safety settings", "details": f"Reason: {block_reason}"}
 
                 # Check if response has candidates (actual generated content)
-                elif not response.candidates:
-                    response_parts = getattr(response, 'parts', 'N/A') # Try to get parts for debugging
-                    print(f"Error: Gemini response received but has no candidates for {time_period_str}. Response parts: {response_parts}", flush=True)
-                    return {"error": "Gemini response contained no valid candidates", "details": f"Response parts: {response_parts}"}
+                if not response.candidates or not response.candidates[0].content.parts:
+                    print(f"Error: Gemini response received but has no candidates or content for {time_period_str}.", flush=True)
+                    return {"error": "Gemini response contained no valid candidates or content"}
 
                 # If candidates exist, get the text content
                 raw_text = response.text
@@ -559,6 +602,19 @@ def call_gemini_flash(input_content, participants, time_period_str, prompt_creat
                 # Parse the JSON response
                 analysis_data = json.loads(cleaned_text)
                 print(f"  Successfully received and parsed analysis from Google Gemini for {time_period_str}.", flush=True)
+                # Ensure the analysis data is JSON serializable
+                def make_json_serializable(obj):
+                    if isinstance(obj, dict):
+                        return {k: make_json_serializable(v) for k, v in obj.items()}
+                    elif isinstance(obj, list):
+                        return [make_json_serializable(item) for item in obj]
+                    elif isinstance(obj, set):
+                        return list(obj)
+                    elif isinstance(obj, tuple):
+                        return list(obj)
+                    else:
+                        return obj
+                analysis_data = make_json_serializable(analysis_data)
                 return analysis_data # Success!
 
             except (json.JSONDecodeError) as json_err:
@@ -581,7 +637,7 @@ def call_gemini_flash(input_content, participants, time_period_str, prompt_creat
                  print(f"Raw Response Object (if available): {response}", flush=True)
                  return {"error": "Unexpected response structure or value from Gemini", "details": str(attr_err)}
 
-        except ResourceExhausted as e:
+        except errors.ResourceExhausted as e:
             # Handle rate limit errors (ResourceExhausted)
             print(f"Error during Gemini call attempt {attempt + 1}: {e}", flush=True)
             if attempt < MAX_RETRIES:
@@ -594,9 +650,9 @@ def call_gemini_flash(input_content, participants, time_period_str, prompt_creat
                 print(f"  Max retries ({MAX_RETRIES}) exceeded for rate limit error.", flush=True)
                 return {"error": f"API Rate Limit Exceeded after {MAX_RETRIES + 1} attempts", "details": str(e)}
 
-        except GoogleAPIError as e:
+        except Exception as e:
              # Handle other non-retryable Google API errors
-             print(f"  Non-retryable Google API error occurred during attempt {attempt + 1}: {e}", flush=True)
+             print(f"  Non-retryable error occurred during attempt {attempt + 1}: {e}", flush=True)
              return {"error": f"Google API Call Failed", "details": str(e)}
 
         except Exception as e:
@@ -1039,39 +1095,53 @@ def generate_yearly_report_data_and_pdf(year, monthly_analyses_dict, participant
 # --- Flask Routes ---
 # Define the web application endpoints and their logic.
 
+@app.before_request
+def handle_session():
+    try:
+        # Try to access the session to trigger loading
+        session.get('test')
+    except Exception as e:
+        # If session is corrupted, clear it
+        session.clear()
+        print(f"Session corrupted, cleared: {e}", flush=True)
+
 @app.route('/', methods=['GET'])
 def index():
     """Renders the main upload form (index.html)."""
-    # Check if there's an active process ID in the session from a previous upload
-    process_id = session.get('last_process_id')
-    show_generate_button = False
+    try:
+        # Check if there's an active process ID in the session from a previous upload
+        process_id = session.get('last_process_id')
+        show_generate_button = False
 
-    if process_id:
-        # Retrieve data associated with the process ID
-        session_data = session.get(process_id, {})
-        temp_file_path = session_data.get('temp_file_path')
-        # Check if the temporary data file still exists
-        if temp_file_path and os.path.exists(temp_file_path):
-            # If data exists, show the "Generate Reports" button
-            show_generate_button = True
-        else:
-            # If temp file is missing (e.g., server restart, manual deletion),
-            # clean up the stale session data.
-            session.pop(process_id, None)
-            if session.get('last_process_id') == process_id: session.pop('last_process_id', None)
-            session.modified = True
-            # Notify user if the file was expected but missing
-            if temp_file_path:
-                flash('Temporary data expired or missing. Please upload the PDF again.', 'info')
+        if process_id:
+            # Retrieve data associated with the process ID
+            session_data = session.get(process_id, {})
+            temp_file_path = session_data.get('temp_file_path')
+            # Check if the temporary data file still exists
+            if temp_file_path and os.path.exists(temp_file_path):
+                # If data exists, show the "Generate Reports" button
+                show_generate_button = True
+            else:
+                # If temp file is missing (e.g., server restart, manual deletion),
+                # clean up the stale session data.
+                session.pop(process_id, None)
+                if session.get('last_process_id') == process_id: session.pop('last_process_id', None)
+                session.modified = True
+                # Notify user if the file was expected but missing
+                if temp_file_path:
+                    flash('Temporary data expired or missing. Please upload the PDF again.', 'info')
 
-    # Retrieve and display any final status message from the previous report generation run
-    final_status = session.pop('final_status', None)
-    final_status_category = session.pop('final_status_category', 'info')
-    if final_status:
-        flash(final_status, final_status_category)
+        # Retrieve and display any final status message from the previous report generation run
+        final_status = session.pop('final_status', None)
+        final_status_category = session.pop('final_status_category', 'info')
+        if final_status:
+            flash(final_status, final_status_category)
 
-    # Render the main page template
-    return render_template('index.html', show_generate_button=show_generate_button, process_id=process_id)
+        # Render the main page template
+        return render_template('index.html', show_generate_button=show_generate_button, process_id=process_id)
+    except Exception as e:
+        import traceback
+        return f"Error in index: {e}\n\n{traceback.format_exc()}", 500
 
 # --- Helper function for parallel raw log processing ---
 def generate_and_upload_raw_log(year, month, messages, master_folder_name, container_client):
@@ -1099,8 +1169,11 @@ def generate_and_upload_raw_log(year, month, messages, master_folder_name, conta
         pdf_buffer = create_monthly_pdf(messages, year, month)
         # Define the blob path in Azure
         blob_name = f"{master_folder_name}/messages/{year}/{month:02d}/messages_{year}_{month:02d}.pdf"
-        # Upload the PDF buffer
-        upload_to_azure(pdf_buffer, container_client, blob_name)
+        # Upload the PDF buffer if Azure is configured
+        if container_client:
+            upload_to_azure(pdf_buffer, container_client, blob_name)
+        else:
+            print(f"    Azure not configured. Raw log PDF for {month_year_str} generated but not uploaded.", flush=True)
         return (True, year, month) # Indicate success
     except Exception as pdf_or_upload_err:
         # Log errors during PDF creation or upload for this specific month
@@ -1113,6 +1186,7 @@ def generate_and_upload_raw_log(year, month, messages, master_folder_name, conta
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
+    print("Upload route called", flush=True)
     """
     Handles the PDF file upload from the user.
     1. Validates the file.
@@ -1187,7 +1261,8 @@ def upload_file():
             print(f"  File size: {len(pdf_stream_bytes)} bytes.", flush=True)
 
             # Extract text and participants using the helper function
-            full_text, participants = extract_text_and_participants(io.BytesIO(pdf_stream_bytes))
+            full_text, participants_str, participants_list = extract_text_and_participants(io.BytesIO(pdf_stream_bytes))
+            participants = participants_str
             print(f"Extracted {len(full_text)} characters. Participants detected: '{participants}'", flush=True)
 
             # Check if any text was extracted
@@ -1217,6 +1292,10 @@ def upload_file():
             # --- Save Temporary Data ---
             # Store the parsed message structure locally for the next step (report generation)
             print(f"Saving parsed message structure to temporary file: {temp_file_path}", flush=True)
+            # Convert defaultdict to regular dict to ensure JSON serializability
+            messages_by_year_month = dict(messages_by_year_month)
+            for year in messages_by_year_month:
+                messages_by_year_month[year] = dict(messages_by_year_month[year])
             with open(temp_file_path, 'w', encoding='utf-8') as f:
                 # Convert integer keys (year, month) to strings for JSON compatibility
                 serializable_data = {
@@ -1230,7 +1309,7 @@ def upload_file():
             # Save key information needed for the next step in the user's session
             session['last_process_id'] = process_id
             session[process_id] = {
-                'participants': participants,
+                'participants': participants_list,
                 'master_folder': master_folder_name, # Folder name in Azure
                 'temp_file_path': temp_file_path,   # Path to local data file
                 'total_months': total_months_found
@@ -1240,10 +1319,14 @@ def upload_file():
 
             # --- Parallel Raw Log Upload ---
             # Generate and upload the simple raw message PDFs for each month concurrently
-            print("\nConnecting to Azure Blob Storage for raw log upload...", flush=True)
-            blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
-            container_client = blob_service_client.get_container_client(AZURE_STORAGE_CONTAINER_NAME)
-            print(f"Connected to Azure container: {AZURE_STORAGE_CONTAINER_NAME}", flush=True)
+            if USE_AZURE:
+                print("\nConnecting to Azure Blob Storage for raw log upload...", flush=True)
+                blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+                container_client_raw = blob_service_client.get_container_client(AZURE_STORAGE_CONTAINER_NAME)
+                print(f"Connected to Azure container: {AZURE_STORAGE_CONTAINER_NAME}", flush=True)
+            else:
+                print("\nAzure not configured. Skipping raw log upload.", flush=True)
+                container_client_raw = None
 
             # Create list of tasks (one per month) for the thread pool
             tasks = []
@@ -1258,7 +1341,7 @@ def upload_file():
             with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 # Submit all tasks and store futures
                 future_to_month = {
-                    executor.submit(generate_and_upload_raw_log, year, month, msgs, master_folder_name, container_client): (year, month)
+                    executor.submit(generate_and_upload_raw_log, year, month, msgs, master_folder_name, container_client_raw): (year, month)
                     for year, month, msgs in tasks
                 }
 
@@ -1292,10 +1375,18 @@ def upload_file():
             else:
                 flash(f'Successfully processed PDF and uploaded all {upload_count} monthly raw message logs ({duration:.2f}s). You can now generate analysis reports.', 'success')
 
+            # Test session serializability before redirect
+            try:
+                json.dumps(dict(session))
+                print("Session is serializable", flush=True)
+            except Exception as sess_e:
+                print(f"Session serialization error: {sess_e}", flush=True)
+                raise
+
             # Redirect back to the index page (which will now show the Generate button)
             return redirect(url_for('index'))
 
-        except fitz.fitz.FileDataError as fe:
+        except fitz.FileDataError as fe:
              # Handle specific error for invalid/corrupted PDFs
              flash(f'Error: The uploaded file does not appear to be a valid PDF or is corrupted. Details: {fe}', 'error')
              # Perform cleanup if PDF processing failed early
@@ -1324,7 +1415,7 @@ def upload_file():
             print(f"Detailed Error during upload/parse phase: {e.__class__.__name__}: {e}", flush=True)
             import traceback
             traceback.print_exc() # Log stack trace for debugging
-            return redirect(url_for('index'))
+            return f"Internal Server Error: {e}\n\n{traceback.format_exc()}", 500
 
     # Fallback redirect if no file was processed (shouldn't normally happen with checks above)
     return redirect(url_for('index'))
@@ -1428,9 +1519,17 @@ def process_one_month(year, month, messages, participants, selected_model, temp_
         # Define Azure blob path
         report_blob_name = f"{master_folder_name}/reports/{selected_model}/{year}/{month:02d}/analysis_report_{year}_{month:02d}{suffix}.pdf"
 
-        print(f"  Uploading monthly report for {month_year_str} to Azure: {report_blob_name}", flush=True)
-        # Upload the generated PDF (success or error report)
-        upload_to_azure(local_pdf_path, container_client, report_blob_name)
+        if container_client:
+            print(f"  Uploading monthly report for {month_year_str} to Azure: {report_blob_name}", flush=True)
+            # Upload the generated PDF (success or error report)
+            upload_to_azure(local_pdf_path, container_client, report_blob_name)
+        else:
+            # Save locally
+            if LOCAL_REPORTS_DIR:
+                os.makedirs(LOCAL_REPORTS_DIR, exist_ok=True)
+                local_path = os.path.join(LOCAL_REPORTS_DIR, os.path.basename(local_pdf_path))
+                shutil.copy(local_pdf_path, local_path)
+                print(f"  Saved monthly report for {month_year_str} locally: {local_path}", flush=True)
 
         # Final status check: If analysis was initially successful, but an error report PDF
         # was generated (due to PDF build failure), mark the final status as 'pdf_error'.
@@ -1484,22 +1583,28 @@ def process_one_year(year, monthly_data_for_year, participants, selected_model, 
                'success_error_report': Yearly AI failed or PDF build failed, but an error report PDF was successfully generated/uploaded.
                'error': Critical failure during yearly processing (e.g., PDF save/upload failed).
     """
-    print(f"------ Starting Yearly Processing for: {year} ------", flush=True)
+    import time
+    task_start_time = time.time()
+    print(f">>>>> [YEARLY TASK START] Year {year} - {time.strftime('%H:%M:%S')} - Starting monthly data aggregation ({len(monthly_data_for_year)} months)", flush=True)
     local_pdf_path = None
     status_flag = 'error' # Default status
 
     try:
         # --- Generate Yearly Report Data & PDF ---
         # This function handles the AI call for yearly synthesis AND generates the PDF (success or error)
+        print(f"  Year {year}: Calling generate_yearly_report_data_and_pdf() - {time.strftime('%H:%M:%S')}", flush=True)
         local_pdf_path = generate_yearly_report_data_and_pdf(
             year, monthly_data_for_year, participants, selected_model,
             master_folder_name, temp_report_dir
         )
+        print(f"  Year {year}: PDF generation returned at {time.strftime('%H:%M:%S')}: {local_pdf_path}", flush=True)
 
         # --- Check PDF Generation Result ---
         if not local_pdf_path or not os.path.exists(local_pdf_path):
              # Failed to create/save the yearly PDF (even an error report)
-             print(f"!! Failed to create or save local yearly PDF for {year}", flush=True)
+             print(f"!! Year {year}: Failed to create or save local yearly PDF for {year}", flush=True)
+             elapsed = time.time() - task_start_time
+             print(f"<<< [YEARLY TASK FAILED] Year {year} - Elapsed {elapsed:.1f}s - Error creating PDF", flush=True)
              return (year, 'error') # Return error status for the year
 
         # --- Determine Blob Name and Upload ---
@@ -1509,18 +1614,30 @@ def process_one_year(year, monthly_data_for_year, participants, selected_model, 
         # Define Azure blob path for the yearly report
         report_blob_name = f"{master_folder_name}/reports/{selected_model}/{year}/yearly_analysis_report_{year}{suffix}.pdf"
 
-        print(f"  Uploading yearly report for {year} to Azure: {report_blob_name}", flush=True)
-        # Upload the generated yearly PDF
-        upload_to_azure(local_pdf_path, container_client, report_blob_name)
+        if container_client:
+            print(f"  Year {year}: Uploading yearly report to Azure: {report_blob_name} - {time.strftime('%H:%M:%S')}", flush=True)
+            # Upload the generated yearly PDF
+            upload_to_azure(local_pdf_path, container_client, report_blob_name)
+            print(f"  Year {year}: Azure upload completed - {time.strftime('%H:%M:%S')}", flush=True)
+        else:
+            # Save locally
+            if LOCAL_REPORTS_DIR:
+                os.makedirs(LOCAL_REPORTS_DIR, exist_ok=True)
+                local_path = os.path.join(LOCAL_REPORTS_DIR, os.path.basename(local_pdf_path))
+                shutil.copy(local_pdf_path, local_path)
+
+                print(f"  Saved yearly report for {year} locally: {local_path}", flush=True)
 
         # Determine final status based on whether a success or error report was uploaded
         status_flag = 'success_error_report' if is_error_report else 'success'
-        print(f"------ Finished Yearly Processing for: {year} with status: {status_flag} ------", flush=True)
+        elapsed = time.time() - task_start_time
+        print(f"<<< [YEARLY TASK SUCCESS] Year {year} - Elapsed {elapsed:.1f}s - Status: {status_flag}", flush=True)
         return (year, status_flag)
 
     except Exception as e:
         # --- Catch-all for unexpected errors during this year's processing task ---
-        print(f"!! Uncaught Error during yearly processing/upload for {year}: {e}", flush=True)
+        elapsed = time.time() - task_start_time
+        print(f"!!! [YEARLY TASK EXCEPTION] Year {year} - Elapsed {elapsed:.1f}s - Error: {e}", flush=True)
         import traceback
         traceback.print_exc() # Log stack trace
         return (year, 'error') # Return error status for the year
@@ -1652,11 +1769,17 @@ def generate_reports():
     print(f"\nFound {total_months_to_process} total Month(s) across {total_years_to_process} Year(s) to analyze.", flush=True)
 
     try:
-        # --- Connect to Azure ---
-        print("Connecting to Azure Blob Storage for report upload...", flush=True)
-        blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
-        container_client = blob_service_client.get_container_client(AZURE_STORAGE_CONTAINER_NAME)
-        print("Connected to Azure.", flush=True)
+        # --- Connect to Azure or use local storage ---
+        if USE_AZURE:
+            print("Connecting to Azure Blob Storage for report upload...", flush=True)
+            blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+            container_client = blob_service_client.get_container_client(AZURE_STORAGE_CONTAINER_NAME)
+            print("Connected to Azure.", flush=True)
+        else:
+            print("Azure not configured. Reports will be saved locally.", flush=True)
+            local_reports_dir = os.path.join(os.getcwd(), "reports")
+            os.makedirs(local_reports_dir, exist_ok=True)
+            container_client = None
 
         # --- Parallel Monthly Processing ---
         print(f"\n======= Starting PARALLEL Monthly Analysis ({total_months_to_process} months) using up to {MAX_WORKERS} workers =======", flush=True)
@@ -1676,14 +1799,19 @@ def generate_reports():
                 for year, month, msgs in monthly_tasks
             }
 
-            # Collect results as tasks complete
-            for future in concurrent.futures.as_completed(future_to_month):
+            # Collect results as tasks complete with timeout protection
+            MONTHLY_TASK_TIMEOUT = 1200  # 20 minutes timeout per month
+            for future in concurrent.futures.as_completed(future_to_month, timeout=MONTHLY_TASK_TIMEOUT + 60):
                 year, month = future_to_month[future]
                 try:
                     # Result is tuple: (year, month, analysis_data, status)
-                    m_year, m_month, m_analysis_data, m_status = future.result()
+                    m_year, m_month, m_analysis_data, m_status = future.result(timeout=MONTHLY_TASK_TIMEOUT)
                     # Store result keyed by (year, month)
                     monthly_results[(m_year, m_month)] = (m_analysis_data, m_status)
+                except concurrent.futures.TimeoutError:
+                    # Handle timeout from as_completed or result()
+                    print(f"!!! TIMEOUT: Monthly processing for {year}-{month:02d} exceeded {MONTHLY_TASK_TIMEOUT}s limit", flush=True)
+                    monthly_results[(year, month)] = ({"error": f"Task timeout after {MONTHLY_TASK_TIMEOUT}s"}, "task_timeout")
                 except Exception as exc:
                     # Catch critical errors in the task execution itself
                     print(f"!!! CRITICAL ERROR in monthly task future for {year}-{month:02d}: {exc}", flush=True)
@@ -1721,27 +1849,36 @@ def generate_reports():
             processed_yearly_count = 0
             # Use ThreadPoolExecutor for concurrent yearly processing
             with concurrent.futures.ThreadPoolExecutor(max_workers=num_yearly_workers, thread_name_prefix="YearWorker") as executor:
+                print(f"[YEARLY EXECUTOR] Created with {num_yearly_workers} workers, submitting {len(yearly_tasks)} yearly tasks...", flush=True)
                 # Submit all yearly tasks
                 future_to_year = {
                     executor.submit(process_one_year, year, monthly_data, participants, selected_model, report_temp_dir, master_folder_name, container_client): year
                     for year, monthly_data in yearly_tasks
                 }
+                print(f"[YEARLY EXECUTOR] All {len(future_to_year)} yearly tasks submitted. Beginning collection phase...", flush=True)
 
-                # Collect results as tasks complete
-                for future in concurrent.futures.as_completed(future_to_year):
-                    year = future_to_year[future]
-                    try:
-                        # Result is tuple: (year, status_flag)
-                        y_year, y_status = future.result()
-                        yearly_results[y_year] = y_status # Store status for the year
-                    except Exception as exc:
-                        # Catch critical errors in the task execution itself
-                        print(f"!!! CRITICAL ERROR in yearly task future for {year}: {exc}", flush=True)
-                        yearly_results[year] = 'error' # Mark year as failed if task crashed
-                    finally:
-                         # Log progress
-                         processed_yearly_count += 1
-                         print(f"  Completed {processed_yearly_count}/{len(years_to_process_yearly)} yearly tasks...", flush=True)
+            # Collect results as tasks complete with timeout protection
+            print(f"[YEARLY COLLECTION] Starting to collect {len(future_to_year)} yearly task results with 3600s timeout per task...", flush=True)
+            YEARLY_TASK_TIMEOUT = 3600  # 1 hour timeout per year
+            for future in concurrent.futures.as_completed(future_to_year, timeout=YEARLY_TASK_TIMEOUT + 60):
+                year = future_to_year[future]
+                try:
+                    # Result is tuple: (year, status_flag)
+                    y_year, y_status = future.result(timeout=YEARLY_TASK_TIMEOUT)
+                    yearly_results[y_year] = y_status # Store status for the year
+                    print(f"  Year {y_year} processing completed with status: {y_status}", flush=True)
+                except concurrent.futures.TimeoutError:
+                    # Handle timeout from as_completed or result()
+                    print(f"!!! TIMEOUT: Yearly processing for {year} exceeded {YEARLY_TASK_TIMEOUT}s limit", flush=True)
+                    yearly_results[year] = 'timeout'
+                except Exception as exc:
+                    # Catch critical errors in the task execution itself
+                    print(f"!!! CRITICAL ERROR in yearly task future for {year}: {exc}", flush=True)
+                    yearly_results[year] = 'error' # Mark year as failed if task crashed
+                finally:
+                     # Log progress
+                     processed_yearly_count += 1
+                     print(f"  Completed {processed_yearly_count}/{len(years_to_process_yearly)} yearly tasks...", flush=True)
 
             print("======= Finished PARALLEL Yearly Analysis =======", flush=True)
         else:
@@ -1911,17 +2048,6 @@ def generate_reports():
 # --- Run the App ---
 # Entry point for running the Flask application.
 if __name__ == '__main__':
-    try:
-        # Use Waitress, a production-quality WSGI server, if available
-        from waitress import serve
-        # Set number of worker threads for Waitress (adjust based on server resources & MAX_WORKERS)
-        waitress_threads = max(4, MAX_WORKERS * 2) # Ensure at least 4 threads, more if MAX_WORKERS is high
-        print(f"--- Starting Waitress server on http://0.0.0.0:5000 with {waitress_threads} threads (Task Workers: {MAX_WORKERS}) ---")
-        serve(app, host='0.0.0.0', port=5000, threads=waitress_threads)
-    except ImportError:
-        # Fallback to Flask's built-in development server if Waitress is not installed
-        print("--- Waitress not found. Falling back to Flask development server. ---")
-        print("--- For production environments, install waitress: pip install waitress ---")
-        # Use threaded=True for basic concurrency with the dev server (suitable for testing)
-        # debug=True enables auto-reloading and detailed error pages (DO NOT USE IN PRODUCTION)
-        app.run(debug=False, host='0.0.0.0', port=5000, threaded=True) 
+    # Run the Flask application in development mode
+    print("--- Starting Flask development server ---")
+    app.run(debug=True, host='0.0.0.0', port=5000, threaded=False, use_reloader=True) 
