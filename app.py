@@ -54,7 +54,7 @@ USE_AZURE = AZURE_STORAGE_CONNECTION_STRING != "InsertYourConnectionString" and 
 LOCAL_REPORTS_DIR = os.path.join(os.getcwd(), "reports") if not USE_AZURE else None
 
 # Google AI API Key and Model
-GOOGLE_API_KEY = "AIzaSyCxEfOcVsQAn2OMyvgrVGEZlg8id9NFBKo"
+GOOGLE_API_KEY = ""
 GEMINI_MODEL_NAME = "gemini-2.5-flash" # Model for Google AI analysis
 
 # Azure OpenAI Service configuration
